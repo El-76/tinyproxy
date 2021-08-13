@@ -1023,8 +1023,6 @@ log_message (LOG_WARNING, "Processing headers.");
          */
         iter = 0;
 
-log_message (LOG_WARNING, "Sending headers.");
-
         while((iter = orderedmap_next(hashofheaders, iter, &data, &header))) {
                 if (!is_anonymous_enabled (config)
                     || anonymous_search (config, data) > 0) {
@@ -1043,11 +1041,12 @@ log_message (LOG_WARNING, "Sending headers.");
                         }
                 }
         }
+
 #if defined(XTINYPROXY_ENABLE)
         if (config->add_xtinyproxy)
                 add_xtinyproxy_header (buf, size, l, connptr);
 #endif
-log_message (LOG_WARNING, "L=%hu, SIZE=%hu", l, size);
+
         /* Write the final "blank" line to signify the end of the headers */
         if (fill_message (buf, size, l, "\r\n") < 0)
                 return -1;
@@ -1809,7 +1808,7 @@ e401:
                 if (!connptr->connect_method)
                         process_http_connection (&buf, &size, &l, connptr, request);
         }
-log_message (LOG_WARNING, "Processed HTTP connecton L=%hu, SIZE=%hu", l, size);
+
         if (process_client_headers (&buf, &size, &l, connptr, hashofheaders) < 0) {
                 update_stats (STAT_BADCONN);
                 log_message (LOG_INFO,
