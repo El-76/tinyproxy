@@ -79,6 +79,53 @@ ssize_t safe_read (int fd, void *buffer, size_t count)
         return len;
 }
 
+int fill_message(char **buf, size_t *size, size_t *l, const char *fmt, ...) {
+        ssize_t n;
+        char *tmpbuf;
+        va_list ap;
+
+        size_t nsize = 1024 * 8 + *size;
+        if (*buf == NULL) {
+                if ((*buf = (char *) safemalloc (nsize)) == NULL)
+                        return -1;
+        } else {
+                if ((tmpbuf = (char *) saferealloc (*buf, nsize)) == NULL) {
+                        safefree (*buf);
+                        return -1;
+                } else
+                        *buf = tmpbuf;
+        }
+
+        while (1) {
+                va_start (ap, fmt);
+                n = vsnprintf (*buf + *l, nsize, fmt, ap);
+                va_end (ap);
+
+                /* If that worked, break out so we can send the buffer */
+                if (n > -1 && (size_t) n < nsize)
+                        break;
+
+                /* Else, try again with more space */
+                if (n > -1)
+                        /* precisely what is needed (glibc2.1) */
+                        nsize = n + 1;
+                else
+                        /* twice the old size (glibc2.0) */
+                        nsize *= 2;
+
+                if ((tmpbuf = (char *) saferealloc (*buf, nsize)) == NULL) {
+                        safefree (*buf);
+                        return -1;
+                } else
+                        *buf = tmpbuf;
+        }
+
+        *l += n;
+        *size = nsize;
+
+        return 0;
+}
+
 /*
  * Send a "message" to the file descriptor provided. This handles the
  * differences between the various implementations of vsnprintf. This code

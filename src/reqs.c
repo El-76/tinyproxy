@@ -301,6 +301,57 @@ establish_http_connection (struct conn_s *connptr, struct request_s *request)
 }
 
 /*
+ * Process connection for HTTP connections.
+ */
+static int
+process_http_connection (char **buf, size_t *size, size_t *l, struct conn_s *connptr, struct request_s *request)
+{
+        char portbuff[7];
+        char dst[sizeof(struct in6_addr)];
+
+        /* Build a port string if it's not a standard port */
+        if (request->port != HTTP_PORT && request->port != HTTP_PORT_SSL)
+                snprintf (portbuff, 7, ":%u", request->port);
+        else
+                portbuff[0] = '\0';
+
+        if (inet_pton(AF_INET6, request->host, dst) > 0) {
+                /* host is an IPv6 address literal, so surround it with
+                 * [] */
+                return fill_message (buf, size, l,
+                                      "%s %s HTTP/1.%u\r\n"
+                                      "Host: [%s]%s\r\n"
+                                      "Connection: close\r\n",
+                                      request->method, request->path,
+                                      connptr->protocol.major != 1 ? 0 :
+                                               connptr->protocol.minor,
+                                      request->host, portbuff);
+        } else if (connptr->upstream_proxy &&
+                   connptr->upstream_proxy->type == PT_HTTP &&
+                   connptr->upstream_proxy->ua.authstr) {
+                return fill_message (buf, size, l,
+                                      "%s %s HTTP/1.%u\r\n"
+                                      "Host: %s%s\r\n"
+                                      "Connection: close\r\n"
+                                      "Proxy-Authorization: Basic %s\r\n",
+                                      request->method, request->path,
+                                      connptr->protocol.major != 1 ? 0 :
+                                               connptr->protocol.minor,
+                                      request->host, portbuff,
+                                      connptr->upstream_proxy->ua.authstr);
+        } else {
+                return fill_message (buf, size, l,
+                                      "%s %s HTTP/1.%u\r\n"
+                                      "Host: %s%s\r\n"
+                                      "Connection: close\r\n",
+                                      request->method, request->path,
+                                      connptr->protocol.major != 1 ? 0 :
+                                               connptr->protocol.minor,
+                                      request->host, portbuff);
+        }
+}
+
+/*
  * These two defines are for the SSL tunnelling.
  */
 #define SSL_CONNECTION_RESPONSE "HTTP/1.0 200 Connection established"
@@ -597,10 +648,10 @@ ERROR_EXIT:
  * the server.
  *	-rjkaes
  */
-static int add_xtinyproxy_header (struct conn_s *connptr)
+static int add_xtinyproxy_header (char **buf, size_t *size, size_t *l, struct conn_s *connptr)
 {
         assert (connptr && connptr->server_fd >= 0);
-        return write_message (connptr->server_fd,
+        return fill_message (buf, size, l,
                               "X-Tinyproxy: %s\r\n", connptr->client_ip_addr);
 }
 #endif /* XTINYPROXY */
@@ -850,6 +901,47 @@ done:
         return ret;
 }
 
+static int
+process_via_header (char **buf, size_t *size, size_t *l, orderedmap hashofheaders,
+                  unsigned int major, unsigned int minor)
+{
+        char hostname[512];
+        char *data;
+        int ret;
+
+        if (config->disable_viaheader) {
+                ret = 0;
+                goto done;
+        }
+
+        if (config->via_proxy_name) {
+                strlcpy (hostname, config->via_proxy_name, sizeof (hostname));
+        } else if (gethostname (hostname, sizeof (hostname)) < 0) {
+                strlcpy (hostname, "unknown", 512);
+        }
+
+        /* 
+         * See if there is a "Via" header.  If so, again we need to do a bit
+         * of processing.
+         */
+        data = orderedmap_find (hashofheaders, "via");
+        if (data) {
+                ret = fill_message (buf, size, l,
+                                     "Via: %s, %hu.%hu %s (%s/%s)\r\n",
+                                     data, major, minor, hostname, PACKAGE,
+                                     VERSION);
+
+                orderedmap_remove (hashofheaders, "via");
+        } else {
+                ret = fill_message (buf, size, l,
+                                     "Via: %hu.%hu %s (%s/%s)\r\n",
+                                     major, minor, hostname, PACKAGE, VERSION);
+        }
+
+done:
+        return ret;
+}
+
 /*
  * Number of buckets to use internally in the hashmap.
  */
@@ -862,8 +954,10 @@ done:
  *	- rjkaes
  */
 static int
-process_client_headers (struct conn_s *connptr, orderedmap hashofheaders)
+process_client_headers (char **buf, size_t *size, size_t *l, struct conn_s *connptr, orderedmap hashofheaders)
 {
+log_message (LOG_WARNING, "Processing headers.");
+
         static const char *skipheaders[] = {
                 "host",
                 "keep-alive",
@@ -910,7 +1004,8 @@ process_client_headers (struct conn_s *connptr, orderedmap hashofheaders)
         }
 
         /* Send, or add the Via header */
-        ret = write_via_header (connptr->server_fd, hashofheaders,
+        ret = process_via_header (buf, size, l,
+                                hashofheaders,
                                 connptr->protocol.major,
                                 connptr->protocol.minor);
         if (ret < 0) {
@@ -927,11 +1022,14 @@ process_client_headers (struct conn_s *connptr, orderedmap hashofheaders)
          * Output all the remaining headers to the remote machine.
          */
         iter = 0;
+
+log_message (LOG_WARNING, "Sending headers.");
+
         while((iter = orderedmap_next(hashofheaders, iter, &data, &header))) {
                 if (!is_anonymous_enabled (config)
                     || anonymous_search (config, data) > 0) {
                         ret =
-                            write_message (connptr->server_fd,
+                            fill_message (buf, size, l,
                                            "%s: %s\r\n", data, header);
                         if (ret < 0) {
                                 indicate_http_error (connptr, 503,
@@ -947,11 +1045,11 @@ process_client_headers (struct conn_s *connptr, orderedmap hashofheaders)
         }
 #if defined(XTINYPROXY_ENABLE)
         if (config->add_xtinyproxy)
-                add_xtinyproxy_header (connptr);
+                add_xtinyproxy_header (buf, size, l, connptr);
 #endif
-
+log_message (LOG_WARNING, "L=%hu, SIZE=%hu", l, size);
         /* Write the final "blank" line to signify the end of the headers */
-        if (safe_write (connptr->server_fd, "\r\n", 2) < 0)
+        if (fill_message (buf, size, l, "\r\n") < 0)
                 return -1;
 
         /*
@@ -1534,6 +1632,10 @@ void handle_connection (struct conn_s *connptr, union sockaddr_union* addr)
         char sock_ipaddr[IP_LENGTH];
         char peer_ipaddr[IP_LENGTH];
 
+        char *buf;
+        size_t size;
+        size_t l;
+
         getpeer_information (addr, peer_ipaddr, sizeof(peer_ipaddr));
 
         if (config->bindsame)
@@ -1678,6 +1780,10 @@ e401:
                 HC_FAIL();
         }
 
+        buf = NULL;
+        size = 0;
+        l = 0;
+
         connptr->upstream_proxy = UPSTREAM_HOST (request->host);
         if (connptr->upstream_proxy != NULL) {
                 if (connect_to_upstream (connptr, request) < 0) {
@@ -1701,10 +1807,10 @@ e401:
                              connptr->server_fd);
 
                 if (!connptr->connect_method)
-                        establish_http_connection (connptr, request);
+                        process_http_connection (&buf, &size, &l, connptr, request);
         }
-
-        if (process_client_headers (connptr, hashofheaders) < 0) {
+log_message (LOG_WARNING, "Processed HTTP connecton L=%hu, SIZE=%hu", l, size);
+        if (process_client_headers (&buf, &size, &l, connptr, hashofheaders) < 0) {
                 update_stats (STAT_BADCONN);
                 log_message (LOG_INFO,
                              "process_client_headers failed: %s. host \"%s\" using "
@@ -1714,6 +1820,13 @@ e401:
 
                 HC_FAIL();
         }
+
+        if (safe_write (connptr->server_fd, buf, l) < 0) {
+                safefree (buf);
+                HC_FAIL();
+        }
+
+        safefree (buf);
 
         if (!connptr->connect_method || UPSTREAM_IS_HTTP(connptr)) {
                 if (process_server_headers (connptr) < 0) {
